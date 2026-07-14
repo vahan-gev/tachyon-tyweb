@@ -1,0 +1,6 @@
+[package]
+name = "tyweb"
+version = "0.1.0"
+edition = "2026"
+repo = "git+https://github.com/vahan-gev/tachyon-tyweb"
+deps = ["git+https://github.com/vahan-gev/tachyon-crypto#v0.1.0"]

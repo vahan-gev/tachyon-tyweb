@@ -1,0 +1,103 @@
+// tyweb.session — cookies and signed sessions over the built-in server.
+//
+//   import tyweb.session as s;
+//
+//   // in a handler:
+//   let who = s.session("secret-key");           // Json? — the logged-in user, or null
+//   s.setSession("secret-key", `{"user":"ada"}`, 3600);   // sign + set a cookie
+//   s.clearCookie("session");                     // log out
+//
+// A session is just a signed cookie: the value is an HS256 JWT (crypto.jwtSign),
+// so the client holds it but cannot forge or alter it without the secret. Put an
+// "exp" (unix seconds) claim in the data for a server-enforced expiry, or rely on
+// the cookie's Max-Age for the browser to drop it.
+
+import crypto.hash as crypto;
+
+static SESSION_COOKIE: string = "session";
+
+/// Parse a `Cookie:` header value ("a=1; b=2") into a map.
+function parseCookies(header: string): HashMap<string, string> {
+    let out: HashMap<string, string> = HashMap();
+    for (pair in header.split(";")) {
+        let p = pair.trim();
+        let eq = p.indexOf("=");
+        if (eq <= 0L) { continue; }
+        let name = p.sub(0L, eq).trim();
+        let value = p.sub(eq + 1L, p.len()).trim();
+        if (name.len() > 0L) { out.insert(name, value); }
+    }
+    return out;
+}
+
+/// All cookies on the current request (reads the `Cookie` header). Call inside
+/// a handler — it uses the server's per-request state.
+function cookies(): HashMap<string, string> {
+    return parseCookies(serveHeader("Cookie"));
+}
+
+/// One cookie's value on the current request, or "" if it is not set.
+function cookie(name: string): string {
+    return cookies().getOr(name, "");
+}
+
+/// Build a `Set-Cookie` value with sensible security defaults: HttpOnly (no
+/// JavaScript access), Path=/, SameSite=Lax. `maxAgeSecs <= 0` omits Max-Age
+/// (a session cookie the browser drops on close). Set `secure` for HTTPS-only.
+function buildCookie(name: string, value: string, maxAgeSecs: long,
+                     secure: bool): string {
+    let c = `${name}=${value}; Path=/; HttpOnly; SameSite=Lax`;
+    if (maxAgeSecs > 0L) { c = `${c}; Max-Age=${maxAgeSecs}`; }
+    if (secure) { c = `${c}; Secure`; }
+    return c;
+}
+
+/// Set a cookie on the current response (secure defaults; HTTPS-only flag off,
+/// since the bootstrap server is usually behind a TLS-terminating proxy).
+function setCookie(name: string, value: string, maxAgeSecs: long): void {
+    serveSetHeader("Set-Cookie", buildCookie(name, value, maxAgeSecs, false));
+}
+
+/// Delete a cookie on the client (Max-Age=0 tells the browser to drop it).
+function clearCookie(name: string): void {
+    serveSetHeader("Set-Cookie", `${name}=; Path=/; HttpOnly; Max-Age=0`);
+}
+
+/// Sign `dataJson` and store it in the session cookie. `maxAgeSecs > 0` also
+/// stamps an `exp` claim into the signed data, so an altered or replayed cookie
+/// past that time is rejected by `session()` — the browser Max-Age alone is not
+/// trusted. `secret` is the server's signing key; keep it out of the payload.
+function setSession(secret: string, dataJson: string, maxAgeSecs: long): void {
+    let payload = dataJson;
+    if (maxAgeSecs > 0L) {
+        let exp = nowMillis() / 1000L + maxAgeSecs;
+        payload = injectExp(dataJson, exp);
+    }
+    setCookie(SESSION_COOKIE, crypto.jwtSign(payload, secret), maxAgeSecs);
+}
+
+/// The verified session payload for the current request, or `null` if there is
+/// no session cookie, its signature does not match `secret`, or it has expired.
+/// A non-null result is authentic — it was signed by this server.
+function session(secret: string): string? {
+    let tok = cookie(SESSION_COOKIE);
+    if (tok.len() == 0L) { return null; }
+    return crypto.jwtVerify(tok, secret);
+}
+
+/// End the session (clears the cookie).
+function endSession(): void {
+    clearCookie(SESSION_COOKIE);
+}
+
+// Splice `"exp":<n>` into a JSON object literal `{...}`. Assumes a well-formed
+// object (the common case for session data); a non-object is signed unchanged.
+function injectExp(json: string, exp: long): string {
+    let t = json.trim();
+    if (!t.startsWith("{")) { return json; }
+    let inner = t.sub(1L, t.len()).trim();          // drop the leading '{'
+    if (inner.startsWith("}")) {
+        return `{"exp":${exp}}`;                     // was empty
+    }
+    return `{"exp":${exp},${inner}`;                 // inner still carries the closing '}'
+}

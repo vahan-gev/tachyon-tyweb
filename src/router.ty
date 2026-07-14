@@ -1,0 +1,153 @@
+// tyweb — a small HTTP router over the built-in server (§16.6).
+//
+//   let app = Router();
+//   app.get("/health", (req: Request) => Response(200, "text/plain", "ok"));
+//   app.get("/users/:id", (req: Request) => Response(200, "text/plain",
+//                                                    req.param("id")));
+//   serve(app, 8080, 4);      // 4 worker threads; panics answer 500
+//
+// Patterns: literal segments, `:name` captures, and a trailing `*` wildcard.
+// Handlers are plain function values, so closures capture your app state.
+
+struct Request {
+    method: string;
+    path: string;
+    body: string;
+    params: HashMap<string, string>;
+}
+
+struct Response {
+    status: int;
+    contentType: string;
+    body: string;
+}
+
+struct Route {
+    method: string;
+    pattern: string;
+    handler: (Request) => Response;
+}
+
+class Router {
+    private routes: Vec<Route>;
+
+    constructor() {
+        this.routes = Vec();
+    }
+
+    /// Register a handler for any method (use "*" to match every method).
+    route(method: string, pattern: string, handler: (Request) => Response): void {
+        this.routes.push(Route(method.toUpper(), pattern, handler));
+    }
+
+    get(pattern: string, handler: (Request) => Response): void {
+        this.route("GET", pattern, handler);
+    }
+    post(pattern: string, handler: (Request) => Response): void {
+        this.route("POST", pattern, handler);
+    }
+    put(pattern: string, handler: (Request) => Response): void {
+        this.route("PUT", pattern, handler);
+    }
+    delete(pattern: string, handler: (Request) => Response): void {
+        this.route("DELETE", pattern, handler);
+    }
+
+    /// Resolve a request against the table; 404 when nothing matches.
+    dispatch(method: string, path: string, body: string): Response {
+        const clean = stripQuery(path);
+        for (r in this.routes) {
+            if (r.method != "*" && r.method != method.toUpper()) {
+                continue;
+            }
+            let params: HashMap<string, string> = HashMap();
+            if (matchPattern(r.pattern, clean, &mut params)) {
+                const req = Request(method.toUpper(), clean, body, params);
+                return r.handler(req);
+            }
+        }
+        return Response(404, "text/plain", `no route for ${method} ${clean}`);
+    }
+
+    len(): long {
+        return this.routes.len();
+    }
+}
+
+/// A captured `:name` segment ("" when absent).
+function reqParam(req: &Request, name: string): string {
+    return req.params.getOr(name, "");
+}
+
+/// Drop `?query=...` from a path.
+function stripQuery(path: string): string {
+    const q = path.indexOf("?");
+    if (q < 0L) {
+        return path;
+    }
+    return path.sub(0L, q);
+}
+
+/// Match `/users/:id` against `/users/7`, filling captures. `*` matches the rest.
+function matchPattern(pattern: string, path: string,
+                      out: &mut HashMap<string, string>): bool {
+    const ps = splitPath(pattern);
+    const xs = splitPath(path);
+    let i = 0L;
+    while (i < ps.len()) {
+        const seg = ps[i];
+        if (seg == "*") {
+            return true;                     // wildcard: matches everything left
+        }
+        if (i >= xs.len()) {
+            return false;
+        }
+        if (seg.startsWith(":")) {
+            out.insert(seg.sub(1L, seg.len()), xs[i].clone());
+        } else if (seg != xs[i]) {
+            return false;
+        }
+        i += 1L;
+    }
+    return ps.len() == xs.len();
+}
+
+/// Split a path into non-empty segments.
+function splitPath(p: string): Vec<string> {
+    let out: Vec<string> = Vec();
+    for (seg in p.split("/")) {
+        if (seg.len() > 0L) {
+            out.push(seg);
+        }
+    }
+    return out;
+}
+
+/// Run the router: `workers` accept-loops on one socket, panics isolated as 500s.
+function serve(app: Router, port: int, workers: int): void {
+    if (!serveBind(port)) {
+        panic(`tyweb: cannot bind port ${port}`);
+    }
+    logInfo(`tyweb listening on :${port} (${workers} workers)`);
+    let pool: Vec<Thread> = Vec();
+    for (w in 0..workers) {
+        pool.push(spawn(() => {
+            while (true) {
+                if (!serveAccept()) {
+                    continue;
+                }
+                const err = catchPanic(() => {
+                    const res = app.dispatch(serveMethod(), servePath(), serveBody());
+                    serveReply(res.status, res.contentType, res.body);
+                });
+                if (err != null) {
+                    logError(`handler panicked: ${err}`);
+                    serveReply(500, "text/plain", "internal error");
+                }
+            }
+        }));
+    }
+    for (t in pool) {
+        t.join();
+    }
+}

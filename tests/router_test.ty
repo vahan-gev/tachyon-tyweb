@@ -1,0 +1,85 @@
+@test
+function routingAndParams(): void {
+    let app = Router();
+    app.get("/health", (req: Request) => Response(200, "text/plain", "ok"));
+    app.get("/users/:id", (req: Request) =>
+        Response(200, "text/plain", `user ${reqParam(&req, "id")}`));
+    app.post("/users", (req: Request) => Response(201, "text/plain", req.body));
+    app.get("/static/*", (req: Request) => Response(200, "text/plain", "asset"));
+    assertEq(app.len(), 4L);
+
+    const h = app.dispatch("GET", "/health", "");
+    assertEq(h.status, 200);
+    assertEq(h.body, "ok");
+
+    const u = app.dispatch("GET", "/users/42", "");
+    assertEq(u.body, "user 42");
+
+    // query strings are stripped before matching
+    const q = app.dispatch("GET", "/users/7?verbose=1", "");
+    assertEq(q.body, "user 7");
+
+    const p = app.dispatch("POST", "/users", "{\"name\":\"ada\"}");
+    assertEq(p.status, 201);
+    assertEq(p.body, "{\"name\":\"ada\"}");
+
+    const w = app.dispatch("GET", "/static/css/app.css", "");
+    assertEq(w.body, "asset");
+
+    // method mismatch and unknown path both 404
+    assertEq(app.dispatch("DELETE", "/health", "").status, 404);
+    assertEq(app.dispatch("GET", "/nope", "").status, 404);
+}
+
+@test
+function pathHelpers(): void {
+    assertEq(stripQuery("/a/b?x=1"), "/a/b");
+    assertEq(stripQuery("/a/b"), "/a/b");
+    assertEq(splitPath("/a//b/").len(), 2L);
+    let ps: HashMap<string, string> = HashMap();
+    assertEq(matchPattern("/x/:a/:b", "/x/1/2", &mut ps), true);
+    assertEq(ps.getOr("a", ""), "1");
+    assertEq(ps.getOr("b", ""), "2");
+    assertEq(matchPattern("/x/:a", "/x/1/2", &mut ps), false);
+}
+
+@test
+function closuresCaptureState(): void {
+    let app = Router();
+    const hits = Atomic();
+    app.get("/count", (req: Request) => {
+        hits.add(1);
+        return Response(200, "text/plain", `${hits.get()}`);
+    });
+    assertEq(app.dispatch("GET", "/count", "").body, "1");
+    assertEq(app.dispatch("GET", "/count", "").body, "2");
+}
+
+// Regression (blog-app crash report): a top-level function used as a handler
+// value must not double-free its owning parameter. Lambdas borrow their
+// params; named functions own them — the thunk bridging the two conventions
+// has to hand the callee its own copy. A parameterized route exercises this
+// because Request carries an owning HashMap of captures.
+function namedHandler(req: Request): Response {
+    return Response(200, "text/plain", `id=${reqParam(&req, "id")}`);
+}
+
+function namedNoParams(req: Request): Response {
+    return Response(200, "text/plain", "static");
+}
+
+@test
+function namedFunctionHandlers(): void {
+    let app = Router();
+    app.get("/items", namedNoParams);
+    app.get("/items/:id", namedHandler);
+    app.get("/a/:x/b/:y", namedHandler);
+
+    // repeated dispatch: a double-free shows up on the second call at latest
+    for (i in 0..50) {
+        assertEq(app.dispatch("GET", "/items", "").body, "static");
+        assertEq(app.dispatch("GET", "/items/42", "").body, "id=42");
+        assertEq(app.dispatch("GET", "/items/abc?q=1", "").body, "id=abc");
+        assertEq(app.dispatch("GET", "/a/1/b/2", "").body, "id=");
+    }
+}

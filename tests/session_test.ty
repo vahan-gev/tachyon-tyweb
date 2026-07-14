@@ -1,0 +1,78 @@
+// Cookies and signed sessions. The socket-facing parts (session()/setCookie()
+// read and write the live request) are exercised by the server integration
+// test; here we pin the pure logic: parsing, formatting, and the sign/verify
+// round trip that makes a session cookie unforgeable.
+
+import crypto.hash as crypto;
+
+@test
+function cookieParsing(): void {
+    let c = parseCookies("session=abc; theme=dark; lang=en");
+    assertEq(c.getOr("session", ""), "abc");
+    assertEq(c.getOr("theme", ""), "dark");
+    assertEq(c.getOr("lang", ""), "en");
+    assertEq(c.getOr("missing", "none"), "none");
+
+    // tolerant of stray whitespace and empty segments
+    let c2 = parseCookies("  a=1 ;; b=2 ;");
+    assertEq(c2.getOr("a", ""), "1");
+    assertEq(c2.getOr("b", ""), "2");
+    assertEq(c2.len(), 2L);
+
+    // a valueless or malformed pair is skipped, not crashed on
+    let c3 = parseCookies("=nope; ok=yes; broken");
+    assertEq(c3.getOr("ok", ""), "yes");
+    assertEq(c3.len(), 1L);
+}
+
+@test
+function cookieFormatting(): void {
+    let c = buildCookie("sid", "xyz", 3600L, false);
+    assertEq(c.contains("sid=xyz"), true);
+    assertEq(c.contains("HttpOnly"), true);
+    assertEq(c.contains("SameSite=Lax"), true);
+    assertEq(c.contains("Max-Age=3600"), true);
+    assertEq(c.contains("Secure"), false);
+
+    let s = buildCookie("sid", "xyz", 0L, true);
+    assertEq(s.contains("Max-Age"), false);      // session cookie
+    assertEq(s.contains("Secure"), true);
+}
+
+@test
+function sessionSignVerify(): void {
+    // this is exactly what setSession/session do, minus the socket I/O
+    let secret = "server-signing-key";
+    let data = injectExp(`{"user":"ada","role":"admin"}`, 4102444800L);  // exp 2100
+    let token = crypto.jwtSign(data, secret);
+
+    let ok = crypto.jwtVerify(token, secret);
+    assertEq(ok != null, true);
+    assertEq((ok ?? "").contains("ada"), true);
+    assertEq((ok ?? "").contains("\"exp\":4102444800"), true);
+
+    // a client that flips a byte, or does not have the key, is rejected
+    assertEq(crypto.jwtVerify(token + "0", secret) == null, true);
+    assertEq(crypto.jwtVerify(token, "not-the-key") == null, true);
+}
+
+@test
+function sessionExpiry(): void {
+    let secret = "k";
+    // an expired session is refused even though the signature is valid
+    let expired = crypto.jwtSign(injectExp(`{"user":"ada"}`, 1000000000L), secret);  // 2001
+    assertEq(crypto.jwtVerify(expired, secret) == null, true);
+}
+
+@test
+function injectExpShapes(): void {
+    // adds exp to a populated object, keeping the original fields
+    let a = injectExp(`{"user":"ada"}`, 99L);
+    assertEq(a, `{"exp":99,"user":"ada"}`);
+
+    // an empty object becomes just the exp
+    assertEq(injectExp("{}", 99L), `{"exp":99}`);
+
+    // a non-object is left untouched (signed as-is)
+    assertEq(injectExp("not json", 99L), "not json");
+}
